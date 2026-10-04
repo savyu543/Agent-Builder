@@ -39,6 +39,15 @@ const readFileAsText = (file) => new Promise((resolve, reject) => {
   reader.readAsText(file);
 });
 
+// --- Helpers: URL extraction ---
+const extractUrls = (text) => {
+  if (!text) return [];
+  const urlRegex = /https?:\/\/[^\s)"']+/g;
+  const matches = text.match(urlRegex) || [];
+  // dedupe
+  return Array.from(new Set(matches));
+};
+
 const parseExcelFile = async (file) => {
   const buffer = await readFileAsArrayBuffer(file);
   const workbook = XLSX.read(buffer, { type: 'array' });
@@ -296,6 +305,33 @@ const Node = ({ id, type, x, y, data, isSelected, onMouseDown, onHandleMouseDown
                   className="w-full bg-slate-900 text-[10px] text-slate-300 p-1.5 rounded border border-slate-800 focus:border-orange-500 outline-none font-mono"
                   defaultValue={data.apiKey || ""}
                   placeholder="Google API Key (optional)"
+                  onChange={(e) => handleInputChange('apiKey', e.target.value)}
+                  onMouseDown={(e) => e.stopPropagation()}
+                />
+              </div>
+            </div>
+          )}
+          {data.toolType === 'web-search' && (
+            <div className="p-2 bg-slate-950 border-t border-orange-500/20 space-y-2">
+              <div>
+                <label className="text-[8px] uppercase text-slate-500 font-bold mb-1 block">Provider</label>
+                <select
+                  className="w-full bg-slate-900 text-[10px] text-slate-300 p-1.5 rounded border border-slate-800 focus:border-orange-500 outline-none"
+                  defaultValue={data.provider || 'bing'}
+                  onChange={(e) => handleInputChange('provider', e.target.value)}
+                  onMouseDown={(e) => e.stopPropagation()}
+                >
+                  <option value="bing">Bing</option>
+                  <option value="google">Google (requires custom API)</option>
+                </select>
+              </div>
+              <div>
+                <label className="text-[8px] uppercase text-slate-500 font-bold mb-1 block">API Key (Optional - required for programmatic Bing search)</label>
+                <input 
+                  type="password"
+                  className="w-full bg-slate-900 text-[10px] text-slate-300 p-1.5 rounded border border-slate-800 focus:border-orange-500 outline-none font-mono"
+                  defaultValue={data.apiKey || ""}
+                  placeholder="Bing API Key (optional)"
                   onChange={(e) => handleInputChange('apiKey', e.target.value)}
                   onMouseDown={(e) => e.stopPropagation()}
                 />
@@ -718,6 +754,173 @@ export default function AgentBuilderApp() {
   // --- Tool Execution ---
   const executeTool = async (tool, input) => {
     await wait(300);
+    // Web Search (Bing) - Always fetch and read page content via text-proxy, no API key needed
+    if (tool.data.toolType === 'web-search') {
+      const q = (input || '').trim();
+      if (!q) return 'No query provided for web search.';
+
+      // Helper to fetch with timeout to prevent slow fetches from blocking
+      const fetchWithTimeout = (url, timeoutMs = 5000) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        return fetch(url, { signal: controller.signal })
+          .finally(() => clearTimeout(timer));
+      };
+
+      // Always use text-proxy to fetch search results and top page content (no API key needed)
+      try {
+        addLog('tool', `Searching for: "${q}"`);
+        const searchProxy = `https://r.jina.ai/http://www.bing.com/search?q=${encodeURIComponent(q)}`;
+        const sresp = await fetchWithTimeout(searchProxy, 8000);
+        if (sresp.ok) {
+          const stext = await sresp.text();
+          // Extract all URLs from search results
+          const urlMatches = stext.match(/https?:\/\/[^\s)"'<>]+/gi) || [];
+          const urls = [...new Set(urlMatches)].filter(u => !u.includes('bing.com')).slice(0, 5);
+          
+          if (urls.length === 0) {
+            return `No results found for: "${q}"`;
+          }
+
+          const topUrl = urls[0];
+          addLog('tool', `Found top URL: ${topUrl}`);
+          
+          // Fetch and read the top result page
+          try {
+            const jinaUrl = 'https://r.jina.ai/http://' + topUrl.replace(/^https?:\/\//i, '');
+            const pageResp = await fetchWithTimeout(jinaUrl, 8000);
+            if (pageResp.ok) {
+              let pageText = await pageResp.text();
+              // Limit to reasonable size for fast processing
+              pageText = pageText.slice(0, 2000);
+              addLog('success', `Fetched content from ${topUrl}`);
+              return `URL: ${topUrl}\n\nContent Summary:\n${pageText}`;
+            }
+          } catch (err) {
+            addLog('warn', `Could not fetch page content: ${err.message}`);
+            return `URL: ${topUrl}\n\nCould not retrieve full content, but this is the top result for "${q}"`;
+          }
+        }
+        return `Could not perform search. Please try again.`;
+      } catch (err) {
+        addLog('error', `Search error: ${err.message}`);
+        return `Search failed: ${err.message}`;
+      }
+    }
+    
+    // === Legacy: API-based Bing search (kept for backward compatibility) ===
+    if (tool.data.toolType === 'web-search-api' && tool.data.apiKey) {
+      const provider = tool.data.provider || 'bing';
+      const apiKey = tool.data.apiKey;
+      const q = (input || '').trim();
+      if (!q) return 'No query provided for web search.';
+
+      // Helper to fetch with timeout to prevent slow fetches from blocking
+      const fetchWithTimeout = (url, timeoutMs = 5000) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        return fetch(url, { signal: controller.signal })
+          .finally(() => clearTimeout(timer));
+      };
+
+      if (provider === 'bing' && apiKey) {
+        try {
+          const resp = await fetch(`https://api.bing.microsoft.com/v7.0/search?q=${encodeURIComponent(q)}&count=3`, {
+            headers: { 'Ocp-Apim-Subscription-Key': apiKey }
+          });
+          if (!resp.ok) {
+            const txt = await resp.text();
+            throw new Error(`Bing search failed: ${resp.status} ${txt}`);
+          }
+          const json = await resp.json();
+          let out = `Bing Search Results for "${q}":\n\n`;
+          if (json.webPages && json.webPages.value && json.webPages.value.length) {
+            const results = json.webPages.value.slice(0,3);
+            results.forEach((v, i) => {
+              out += `${i+1}. ${v.name} - ${v.url}\n${v.snippet || ''}\n\n`;
+            });
+
+            // Try to fetch the top result page and extract text for richer context (may fail due to CORS)
+            const top = results[0];
+            try {
+              addLog('tool', `Fetching top result for richer context: ${top.url}`);
+              const pageResp = await fetchWithTimeout(top.url, 5000);
+              if (pageResp.ok) {
+                const html = await pageResp.text();
+                // Strip HTML tags to get plain text
+                const text = html.replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, ' ')
+                                  .replace(/<style[\s\S]*?>[\s\S]*?<\/style>/gi, ' ')
+                                  .replace(/<[^>]+>/g, ' ')
+                                  .replace(/\s+/g, ' ')
+                                  .trim();
+                const short = text.slice(0, 3000);
+                out += `Top result content (first ${short.length} chars):\n${short}\n\n`;
+              } else {
+                out += `Could not fetch top result (status ${pageResp.status}). Trying text-proxy fallback.\n\n`;
+                // fall through to proxy attempt
+                throw new Error(`Direct fetch failed with status ${pageResp.status}`);
+              }
+            } catch (fetchErr) {
+              // Try text-proxy fallback (r.jina.ai) to bypass CORS and get page text
+              try {
+                addLog('tool', `Falling back to text-proxy for: ${top.url}`);
+                const jinaUrl = 'https://r.jina.ai/http://' + top.url.replace(/^https?:\/\//i, '');
+                const proxyResp = await fetchWithTimeout(jinaUrl, 5000);
+                if (proxyResp.ok) {
+                  const proxyText = await proxyResp.text();
+                  const short = proxyText.slice(0, 3000);
+                  out += `Top result content (via text-proxy, first ${short.length} chars):\n${short}\n\n`;
+                } else {
+                  out += `Top result could not be fetched via proxy (status ${proxyResp.status}). Using snippet only.\n\n`;
+                }
+              } catch (proxyErr) {
+                addLog('warn', `Proxy fetch failed: ${proxyErr.message}`);
+                out += `Top result could not be fetched due to CORS or network. Using snippet only.\n\n`;
+              }
+            }
+          } else {
+            out += 'No results found.';
+          }
+          return out;
+        } catch (err) {
+          addLog('error', `Web search error: ${err.message}`);
+          return `Web search error: ${err.message}`;
+        }
+      } else {
+        // No API key: attempt a text-proxy search fetch so we can extract the top result and read it (works around CORS)
+        try {
+          addLog('tool', 'No API key provided — using text-proxy search fallback');
+          const searchProxy = `https://r.jina.ai/http://www.bing.com/search?q=${encodeURIComponent(q)}`;
+          const sresp = await fetch(searchProxy);
+          if (sresp.ok) {
+            const stext = await sresp.text();
+            // Try to extract first URL from search results text
+            const urlMatch = stext.match(/https?:\/\/[^\s)"']+/i);
+            if (urlMatch && urlMatch[0]) {
+              const topUrl = urlMatch[0];
+              addLog('tool', `Found top URL via proxy search: ${topUrl}`);
+              try {
+                const jinaUrl = 'https://r.jina.ai/http://' + topUrl.replace(/^https?:\/\//i, '');
+                const pageResp = await fetch(jinaUrl);
+                if (pageResp.ok) {
+                  const pageText = await pageResp.text();
+                  const snippet = pageText.slice(0, 8000);
+                  return `Top result: ${topUrl}\n\n${snippet}`;
+                }
+              } catch (err) {
+                addLog('warn', `Proxy fetch of topUrl failed: ${err.message}`);
+              }
+            }
+          }
+        } catch (err) {
+          addLog('warn', `Proxy search failed: ${err.message}`);
+        }
+
+        // Fallback to returning the search URL when proxy approach fails
+        const url = `https://www.bing.com/search?q=${encodeURIComponent(q)}`;
+        return `Search URL: ${url}`;
+      }
+    }
     
     // Google Sheets
     if (tool.data.toolType === 'google-sheets') {
@@ -828,6 +1031,9 @@ export default function AgentBuilderApp() {
             addLog("success", `Tool [${tool.data.label}] completed.`);
           }
         }
+        
+        // Extract URLs from tool results to show as clickable actions in the chat
+        const extractedUrls = extractUrls(toolResults);
 
         // Prepare message with tool results
         const enhancedMessage = toolResults 
@@ -845,12 +1051,13 @@ export default function AgentBuilderApp() {
         
         addLog("success", "Response generated successfully.");
         
-        // Add assistant response to chat
+        // Add assistant response to chat (include any extracted URLs so UI can render action buttons)
         setMessages(prev => [...prev, { 
           role: 'assistant', 
           content: response, 
           timestamp: new Date(),
-          agentId: agent.id
+          agentId: agent.id,
+          urls: extractedUrls
         }]);
       } else {
         addLog("system", "Cloud API not implemented yet. Please use Local mode.");
@@ -910,6 +1117,10 @@ export default function AgentBuilderApp() {
             <SidebarItem 
               icon={<FileSpreadsheet size={16}/>} label="Google Sheets" color="orange" 
               onClick={() => setNodes(p => [...p, { id: `tool-${Date.now()}`, type: 'tool', x: -offset.x/zoom + 100, y: -offset.y/zoom + 100, data: { label: 'Google Sheets', description: 'Read data from Google Sheets', toolType: 'google-sheets', sheetId: '', range: 'A1:Z1000', apiKey: '' } }])} 
+            />
+            <SidebarItem 
+              icon={<Wrench size={16}/>} label="Web Search" color="orange" 
+              onClick={() => setNodes(p => [...p, { id: `tool-${Date.now()}`, type: 'tool', x: -offset.x/zoom + 100, y: -offset.y/zoom + 100, data: { label: 'Web Search', description: 'Search the web (Bing). Configure provider and API key for programmatic search', toolType: 'web-search', provider: 'bing', apiKey: '' } }])} 
             />
             <SidebarItem 
               icon={<FileText size={16}/>} label="Local File" color="orange" 
@@ -1097,6 +1308,20 @@ export default function AgentBuilderApp() {
                     }`}
                   >
                     <div className="text-sm whitespace-pre-wrap">{msg.content}</div>
+                    {/* Render clickable URL buttons when present */}
+                    {msg.urls && msg.urls.length > 0 && (
+                      <div className="mt-2 flex flex-col gap-2">
+                        {msg.urls.map((u, idx) => (
+                          <button
+                            key={idx}
+                            onClick={() => typeof window !== 'undefined' && window.open(u, '_blank')}
+                            className="text-left bg-slate-700 hover:bg-slate-600 px-3 py-1 rounded text-xs text-blue-300"
+                          >
+                            Open: {u.length > 60 ? u.slice(0, 60) + '...' : u}
+                          </button>
+                        ))}
+                      </div>
+                    )}
                     <div className="text-xs opacity-60 mt-1">
                       {msg.timestamp.toLocaleTimeString()}
                     </div>
